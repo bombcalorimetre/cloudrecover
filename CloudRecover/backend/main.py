@@ -28,8 +28,9 @@ MAX_BACKUP_AGE_HOURS = 24
 SIMULATED_RECOVERY_SECONDS = 12.0
 
 # Automatic, database-backed demo activity. Set to False to disable it.
-AUTO_SIMULATION_ENABLED = True
+AUTO_SIMULATION_ENABLED = True  # Default state when the API starts
 AUTO_SIMULATION_INTERVAL_SECONDS = 12
+_auto_simulation_enabled = AUTO_SIMULATION_ENABLED
 _AUTO_SIMULATION_TASK = None
 
 
@@ -116,6 +117,11 @@ initialize_database()
 
 class FailureRequest(BaseModel):
     service_id: str
+
+
+class BackupCreateRequest(BaseModel):
+    service_id: str
+    recovery_point: str | None = None
 
 
 def check_backup(db, service_id):
@@ -326,7 +332,7 @@ async def automatic_simulation_loop():
     # Initial delay gives the API time to finish startup and become available.
     while True:
         await asyncio.sleep(AUTO_SIMULATION_INTERVAL_SECONDS)
-        if not AUTO_SIMULATION_ENABLED:
+        if not _auto_simulation_enabled:
             continue
         try:
             run_automatic_simulation_step()
@@ -381,7 +387,7 @@ def root():
         "application": "CloudRecover",
         "status": "running",
         "docs": "/docs",
-        "auto_simulation": AUTO_SIMULATION_ENABLED,
+        "auto_simulation": _auto_simulation_enabled,
         "simulation_interval_seconds": AUTO_SIMULATION_INTERVAL_SECONDS,
     }
 
@@ -391,7 +397,7 @@ def health():
     return {
         "status": "healthy",
         "application": "CloudRecover",
-        "auto_simulation": AUTO_SIMULATION_ENABLED,
+        "auto_simulation": _auto_simulation_enabled,
     }
 
 
@@ -409,6 +415,20 @@ def dashboard():
             service["rpo_met"] = backup_check["rpo_met"]
             service["rto_target_seconds"] = RTO_TARGET_SECONDS.get(service["id"], 30)
 
+        backups = [
+            dict(row) for row in db.execute(
+                "SELECT * FROM backups ORDER BY created_at DESC, id DESC"
+            )
+        ]
+        for backup in backups:
+            service = next((item for item in services if item["id"] == backup["service_id"]), None)
+            backup["service_name"] = service["name"] if service else backup["service_id"]
+            backup["readiness"] = check_backup(db, backup["service_id"])
+            backup["is_latest"] = bool(
+                service and service.get("latest_backup") and service["id"] == backup["service_id"]
+                and service["latest_backup"]["id"] == backup["id"]
+            )
+
         incidents = [
             dict(row) for row in db.execute(
                 "SELECT * FROM incidents ORDER BY created_at DESC LIMIT 100"
@@ -422,6 +442,7 @@ def dashboard():
         total_services = len(services)
         return {
             "services": services,
+            "backups": backups,
             "incidents": incidents,
             "audit": audit,
             "summary": {
@@ -436,7 +457,7 @@ def dashboard():
                 ),
             },
             "auto_simulation": {
-                "enabled": AUTO_SIMULATION_ENABLED,
+                "enabled": _auto_simulation_enabled,
                 "interval_seconds": AUTO_SIMULATION_INTERVAL_SECONDS,
             },
         }
@@ -472,6 +493,66 @@ def execute_recovery(incident_id: str):
         if incident["recovery_status"] != "PENDING":
             raise HTTPException(409, "Recovery already attempted")
         return execute_recovery_in_db(db, incident_id)
+
+
+@app.post("/api/backups")
+def create_backup(request: BackupCreateRequest):
+    """Create a new valid local backup record for a known service."""
+    with get_db() as db:
+        service = db.execute(
+            "SELECT * FROM services WHERE id = ?", (request.service_id,)
+        ).fetchone()
+        if service is None:
+            raise HTTPException(404, "Service not found")
+
+        backup_id = str(uuid.uuid4())[:8]
+        recovery_point = (request.recovery_point or "").strip()
+        if not recovery_point:
+            recovery_point = f"snapshot-{request.service_id}-{backup_id}"
+        db.execute(
+            "INSERT INTO backups (id, service_id, created_at, integrity, recovery_point) VALUES (?, ?, ?, ?, ?)",
+            (backup_id, request.service_id, current_time().isoformat(), "VALID", recovery_point),
+        )
+        log_event(db, "BACKUP_CREATED", f"Backup {backup_id} created for {request.service_id}; recovery point {recovery_point}")
+        return {
+            "backup_id": backup_id,
+            "service_id": request.service_id,
+            "created_at": current_time().isoformat(),
+            "integrity": "VALID",
+            "recovery_point": recovery_point,
+            "message": "Local backup record created",
+        }
+
+
+@app.get("/api/backups")
+def list_backups():
+    """Return backup records with service labels and readiness assessment."""
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM backups ORDER BY created_at DESC, id DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            service = db.execute("SELECT name FROM services WHERE id = ?", (item["service_id"],)).fetchone()
+            item["service_name"] = service["name"] if service else item["service_id"]
+            item["readiness"] = check_backup(db, item["service_id"])
+            latest = db.execute("SELECT id FROM backups WHERE service_id = ? ORDER BY created_at DESC, id DESC LIMIT 1", (item["service_id"],)).fetchone()
+            item["is_latest"] = bool(latest and latest["id"] == item["id"])
+            result.append(item)
+        return {"backups": result, "count": len(result)}
+
+
+@app.post("/api/backups/{backup_id}/repair")
+def repair_backup(backup_id: str):
+    """Mark a simulated corrupted backup as valid; this does not restore real data."""
+    with get_db() as db:
+        backup = db.execute("SELECT * FROM backups WHERE id = ?", (backup_id,)).fetchone()
+        if backup is None:
+            raise HTTPException(404, "Backup not found")
+        if backup["integrity"] == "VALID":
+            raise HTTPException(409, "Backup is already marked valid")
+        db.execute("UPDATE backups SET integrity = 'VALID' WHERE id = ?", (backup_id,))
+        log_event(db, "BACKUP_REPAIRED", f"Backup {backup_id} marked valid in local simulation")
+        return {"backup_id": backup_id, "integrity": "VALID", "message": "Backup marked valid in local simulation"}
 
 
 @app.post("/api/backups/{backup_id}/corrupt")
@@ -510,3 +591,33 @@ def make_backup_stale(service_id: str):
 def manual_simulation_step():
     """Trigger one simulation cycle manually for demos and testing."""
     return run_automatic_simulation_step()
+
+
+@app.post("/api/simulation/pause")
+def pause_simulation():
+    """Pause periodic simulation without stopping manual Run Once actions."""
+    global _auto_simulation_enabled
+    _auto_simulation_enabled = False
+    with get_db() as db:
+        log_event(db, "SIMULATION_PAUSED", "Automatic simulation paused from dashboard")
+    return {"enabled": False, "message": "Automatic simulation paused"}
+
+
+@app.post("/api/simulation/resume")
+def resume_simulation():
+    """Resume periodic simulation at the configured interval."""
+    global _auto_simulation_enabled
+    _auto_simulation_enabled = True
+    with get_db() as db:
+        log_event(db, "SIMULATION_RESUMED", "Automatic simulation resumed from dashboard")
+    return {"enabled": True, "message": "Automatic simulation resumed"}
+
+
+@app.post("/api/simulation/run-once")
+def run_simulation_once():
+    """Run one simulation step on demand, regardless of pause state."""
+    result = run_automatic_simulation_step()
+    with get_db() as db:
+        log_event(db, "SIMULATION_RUN_ONCE", "One simulation step triggered from dashboard")
+    return {"message": "One simulation step completed", "result": result,
+            "enabled": _auto_simulation_enabled}
