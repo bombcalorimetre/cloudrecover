@@ -7,7 +7,12 @@ import {
   Cloud,
   Database,
   FileClock,
+  HardDrive,
+  RotateCcw,
+  Plus,
+  Wrench,
   Play,
+  Pause,
   RefreshCw,
   ShieldCheck,
   ScrollText,
@@ -39,6 +44,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [backupService, setBackupService] = useState("payments-api");
+  const [recoveryPoint, setRecoveryPoint] = useState("");
 
   const loadDashboard = useCallback(async () => {
     try {
@@ -76,7 +83,7 @@ function App() {
       if (result.status === "FAILED") {
         setMessage(`Recovery blocked: ${result.reason}`);
       } else {
-        setMessage(result.message || `Recovery status: ${result.status}`);
+        setMessage(result.message || (result.integrity ? `Backup integrity: ${result.integrity}` : result.backup_id ? `Backup ${result.backup_id} created` : `Recovery status: ${result.status ?? "updated"}`));
       }
       await loadDashboard();
       return result;
@@ -121,6 +128,7 @@ function App() {
         <nav className="nav-links" aria-label="Main navigation">
           <a className="active" href="#overview">Overview</a>
           <a href="#services">Services</a>
+          <a href="#backups">Backups</a>
           <a href="#incidents">Incidents</a>
           <a href="#audit">Audit reports</a>
         </nav>
@@ -166,7 +174,19 @@ function App() {
                 <p className="eyebrow">01 / EXECUTIVE SUMMARY</p>
                 <h2>Recovery posture</h2>
               </div>
-              <span className="section-note"><Activity size={13} /> Auto-refresh · 12s{lastUpdated ? ` · Updated ${lastUpdated.toLocaleTimeString()}` : ""}</span>
+              <div className="summary-actions">
+                <span className={`simulation-state ${data.auto_simulation?.enabled ? "is-running" : "is-paused"}`}>
+                  <span /> {data.auto_simulation?.enabled ? "Auto simulation running" : "Auto simulation paused"}
+                </span>
+                <div className="simulation-buttons">
+                  <button className="button-action" disabled={busy} onClick={() => post("/api/simulation/run-once")}><Play size={12} /> Run once</button>
+                  {data.auto_simulation?.enabled ? (
+                    <button className="button-action" disabled={busy} onClick={() => post("/api/simulation/pause")}><Pause size={12} /> Pause</button>
+                  ) : (
+                    <button className="button-primary" disabled={busy} onClick={() => post("/api/simulation/resume")}><Play size={12} /> Resume</button>
+                  )}
+                </div>
+              </div>
             </div>
             <div className="stats">
               <article className="metric-card">
@@ -266,10 +286,64 @@ function App() {
             </div>
           </section>
 
+          <section className="section-block" id="backups">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">03 / BACKUP MANAGEMENT</p>
+                <h2>Backup inventory</h2>
+                <p className="section-description">Create and inspect local backup records, or simulate integrity and age problems. These actions do not create real cloud backups.</p>
+              </div>
+              <span className="outline-tag"><HardDrive size={13} /> LOCAL SQLITE</span>
+            </div>
+            <div className="backup-manager table-panel">
+              <form className="backup-create-form" onSubmit={async (event) => {
+                event.preventDefault();
+                const result = await post("/api/backups", { service_id: backupService, recovery_point: recoveryPoint.trim() || null });
+                if (result) setRecoveryPoint("");
+              }}>
+                <label>Service
+                  <select value={backupService} onChange={(event) => setBackupService(event.target.value)} disabled={busy}>
+                    {(data.services ?? []).map((service) => <option key={service.id} value={service.id}>{service.name}</option>)}
+                  </select>
+                </label>
+                <label>Recovery point label <span>(optional)</span>
+                  <input value={recoveryPoint} onChange={(event) => setRecoveryPoint(event.target.value)} maxLength={120} placeholder="e.g. pre-release-snapshot" disabled={busy} />
+                </label>
+                <button className="button-primary" type="submit" disabled={busy || !(data.services ?? []).length}><Plus size={14} /> Create backup</button>
+              </form>
+              <div className="backup-list-heading"><strong><HardDrive size={14} /> Stored backup records</strong><span>{data.backups?.length ?? 0} records</span></div>
+              {(data.backups ?? []).length === 0 ? (
+                <div className="empty-state"><HardDrive size={20} /><strong>No backups recorded</strong><span>Create a local backup record to begin.</span></div>
+              ) : (
+                <div className="backup-record-list">
+                  {data.backups.map((backup) => (
+                    <article className="backup-record" key={backup.id}>
+                      <span className={`backup-record-icon ${statusClass(backup.integrity)}`}><FileClock size={17} /></span>
+                      <div className="backup-record-main">
+                        <div className="backup-record-title"><strong>{backup.service_name ?? backup.service_id}</strong><span className={`status-pill ${statusClass(backup.integrity)}`}><span />{backup.integrity}</span>{backup.is_latest && <span className="count-tag">LATEST</span>}</div>
+                        <code>{backup.recovery_point}</code>
+                        <small>ID {backup.id} · Created {formatDate(backup.created_at)}</small>
+                      </div>
+                      <div className="backup-record-actions">
+                        {backup.integrity !== "VALID" ? (
+                          <button className="button-action" disabled={busy} onClick={() => post(`/api/backups/${backup.id}/repair`)}><Wrench size={12} /> Mark valid</button>
+                        ) : (
+                          <button className="button-action" disabled={busy} onClick={() => { if (window.confirm(`Mark backup ${backup.id} as corrupted in the simulation?`)) post(`/api/backups/${backup.id}/corrupt`); }}><AlertTriangle size={12} /> Corrupt</button>
+                        )}
+                        <button className="button-action" disabled={busy} onClick={() => { if (window.confirm(`Set the backup for ${backup.service_name ?? backup.service_id} to 48 hours old?`)) post(`/api/backups/${backup.service_id}/make-stale`); }}><RotateCcw size={12} /> Make stale</button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div className="table-footer"><span><span className="footer-led" /> Persisted in local SQLite</span><span>“Mark valid” changes simulated integrity status; it does not repair an actual file.</span></div>
+            </div>
+          </section>
+
           <div className="lower-grid">
             <section className="section-block lower-section" id="incidents">
               <div className="section-title-row">
-                <div><p className="eyebrow">03 / EVENT HISTORY</p><h2>Recovery incidents</h2></div>
+                <div><p className="eyebrow">04 / EVENT HISTORY</p><h2>Recovery incidents</h2></div>
                 <span className="small-count">{data.incidents?.length ?? 0} records</span>
               </div>
               <div className="activity-panel">
@@ -297,7 +371,7 @@ function App() {
 
             <section className="section-block lower-section" id="audit">
               <div className="section-title-row">
-                <div><p className="eyebrow">04 / AUDIT TRAIL</p><h2>System activity</h2></div>
+                <div><p className="eyebrow">05 / AUDIT TRAIL</p><h2>System activity</h2></div>
                 <span className="small-count">{data.audit?.length ?? 0} events</span>
               </div>
               <div className="activity-panel audit-panel">

@@ -1,11 +1,16 @@
 import asyncio
+import csv
+import io
+import json
 import sqlite3
 import uuid
+import importlib.util
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -83,6 +88,16 @@ def initialize_database():
                 details TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS recovery_drills (
+                id TEXT PRIMARY KEY,
+                service_id TEXT NOT NULL,
+                result TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_seconds REAL NOT NULL,
+                backup_id TEXT,
+                report_json TEXT NOT NULL
+            );
         """)
 
         count = db.execute("SELECT COUNT(*) FROM services").fetchone()[0]
@@ -122,6 +137,10 @@ class FailureRequest(BaseModel):
 class BackupCreateRequest(BaseModel):
     service_id: str
     recovery_point: str | None = None
+
+
+class RecoveryDrillRequest(BaseModel):
+    service_id: str
 
 
 def check_backup(db, service_id):
@@ -439,12 +458,21 @@ def dashboard():
                 "SELECT * FROM audit ORDER BY id DESC LIMIT 30"
             )
         ]
+        drills = []
+        for row in db.execute("SELECT * FROM recovery_drills ORDER BY started_at DESC LIMIT 20"):
+            drill = dict(row)
+            try:
+                drill["steps"] = json.loads(drill.pop("report_json"))
+            except (TypeError, json.JSONDecodeError):
+                drill["steps"] = []
+            drills.append(drill)
         total_services = len(services)
         return {
             "services": services,
             "backups": backups,
             "incidents": incidents,
             "audit": audit,
+            "drills": drills,
             "summary": {
                 "total_services": total_services,
                 "healthy_services": sum(item["status"] == "HEALTHY" for item in services),
@@ -480,6 +508,43 @@ def simulate_failure(request: FailureRequest):
             "status": "PENDING",
             "message": "Failure simulated successfully",
         }
+
+
+@app.post("/api/services/{service_id}/recover")
+def recover_service(service_id: str):
+    """Bring a failed service online in the local simulation using a valid, in-RPO backup."""
+    with get_db() as db:
+        service = db.execute("SELECT * FROM services WHERE id = ?", (service_id,)).fetchone()
+        if service is None:
+            raise HTTPException(404, "Service not found")
+        if service["status"] == "HEALTHY":
+            return {"status": "HEALTHY", "message": f"{service['name']} is already healthy"}
+
+        # Reuse an existing pending incident when possible; otherwise create a recovery
+        # incident so a service can be recovered even after an earlier attempt failed.
+        incident = db.execute(
+            "SELECT * FROM incidents WHERE service_id = ? AND recovery_status = 'PENDING' ORDER BY created_at DESC LIMIT 1",
+            (service_id,),
+        ).fetchone()
+        if incident is None:
+            incident_id = str(uuid.uuid4())[:8]
+            db.execute(
+                "INSERT INTO incidents (id, service_id, status, created_at, recovery_status, recovery_duration) VALUES (?, ?, ?, ?, ?, ?)",
+                (incident_id, service_id, "OPEN", current_time().isoformat(), "PENDING", None),
+            )
+            log_event(db, "MANUAL_RECOVERY_REQUESTED", f"Manual recovery requested for {service['name']}")
+        else:
+            incident_id = incident["id"]
+
+        result = execute_recovery_in_db(db, incident_id)
+        if result is None:
+            raise HTTPException(409, "No recoverable incident is available")
+        if result.get("status") == "FAILED":
+            result["message"] = f"Recovery blocked: {result.get('reason', 'backup is not ready')}"
+            return result
+        result["message"] = f"{service['name']} is back online in the local simulation"
+        log_event(db, "SERVICE_MANUALLY_RECOVERED", f"{service['name']} returned to HEALTHY via incident {incident_id}")
+        return result
 
 
 @app.post("/api/recoveries/{incident_id}/execute")
@@ -587,6 +652,60 @@ def make_backup_stale(service_id: str):
         return {"service_id": service_id, "age_hours": 48}
 
 
+@app.post("/api/drills/run")
+def run_recovery_drill(request: RecoveryDrillRequest):
+    """Run a non-disruptive recovery drill against simulated backup metadata."""
+    with get_db() as db:
+        service = db.execute("SELECT * FROM services WHERE id = ?", (request.service_id,)).fetchone()
+        if service is None:
+            raise HTTPException(404, "Service not found")
+
+        drill_id = str(uuid.uuid4())[:8]
+        started_at = current_time()
+        backup_check = check_backup(db, request.service_id)
+        backup = backup_check["backup"]
+        rto_target = RTO_TARGET_SECONDS.get(request.service_id, 30)
+        simulated_duration = SIMULATED_RECOVERY_SECONDS
+        rto_met = simulated_duration <= rto_target
+        steps = [
+            {"name": "Scenario initialized", "status": "PASSED", "detail": f"Non-disruptive drill prepared for {service['name']}"},
+            {"name": "Failure detection simulated", "status": "PASSED", "detail": "A simulated service failure was detected; live service state was not changed"},
+        ]
+        if backup_check["score"] == 100 and backup:
+            steps.append({"name": "Backup integrity and RPO validated", "status": "PASSED", "detail": f"Latest backup is valid and {backup_check['backup_age_hours']}h old; RPO target is {backup_check['rpo_target_hours']}h"})
+            steps.append({"name": "Recovery point selected", "status": "PASSED", "detail": f"Selected {backup['recovery_point']} (backup {backup['id']})"})
+            steps.append({"name": "Restore simulated", "status": "PASSED", "detail": f"Simulated restore completed in {simulated_duration:.1f}s; no real data was restored"})
+            steps.append({"name": "RTO objective checked", "status": "PASSED" if rto_met else "FAILED", "detail": f"{simulated_duration:.1f}s simulated recovery against {rto_target}s RTO target"})
+        else:
+            steps.append({"name": "Backup integrity and RPO validated", "status": "FAILED", "detail": backup_check["reason"]})
+            steps.append({"name": "Recovery point selected", "status": "SKIPPED", "detail": "No recovery point was selected because backup readiness failed"})
+            steps.append({"name": "Restore simulated", "status": "SKIPPED", "detail": "Restore simulation was skipped to avoid implying recovery from an unready backup"})
+            steps.append({"name": "RTO objective checked", "status": "SKIPPED", "detail": "RTO is not meaningful when the backup fails readiness checks"})
+
+        passed = backup_check["score"] == 100 and rto_met
+        result = "PASS" if passed else "FAIL"
+        db.execute(
+            "INSERT INTO recovery_drills (id, service_id, result, started_at, duration_seconds, backup_id, report_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (drill_id, request.service_id, result, started_at.isoformat(), simulated_duration if backup_check["score"] == 100 else 0.0, backup["id"] if backup else None, json.dumps(steps)),
+        )
+        log_event(db, "RECOVERY_DRILL_" + result, f"Drill {drill_id} for {request.service_id}: {result}; readiness={backup_check['score']}; RTO {'met' if rto_met else 'missed' if backup_check['score'] == 100 else 'not evaluated'}")
+        return {
+            "drill_id": drill_id,
+            "service_id": request.service_id,
+            "result": result,
+            "started_at": started_at.isoformat(),
+            "duration_seconds": simulated_duration if backup_check["score"] == 100 else 0.0,
+            "backup_id": backup["id"] if backup else None,
+            "readiness_score": backup_check["score"],
+            "readiness_reason": backup_check["reason"],
+            "rpo_met": backup_check["rpo_met"],
+            "rto_target_seconds": rto_target,
+            "rto_met": rto_met if backup_check["score"] == 100 else None,
+            "steps": steps,
+            "message": f"Recovery drill {result.lower()} for {service['name']}",
+        }
+
+
 @app.post("/api/simulation/step")
 def manual_simulation_step():
     """Trigger one simulation cycle manually for demos and testing."""
@@ -621,3 +740,118 @@ def run_simulation_once():
         log_event(db, "SIMULATION_RUN_ONCE", "One simulation step triggered from dashboard")
     return {"message": "One simulation step completed", "result": result,
             "enabled": _auto_simulation_enabled}
+
+
+@app.get("/api/reports/drills")
+def recovery_drill_history(limit: int = Query(default=100, ge=1, le=1000)):
+    """Return persisted recovery-drill history for reports and trend views."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM recovery_drills ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        reports = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["steps"] = json.loads(item.pop("report_json"))
+            except (TypeError, json.JSONDecodeError):
+                item["steps"] = []
+            reports.append(item)
+        total = db.execute("SELECT COUNT(*) FROM recovery_drills").fetchone()[0]
+        passed = db.execute("SELECT COUNT(*) FROM recovery_drills WHERE result = 'PASS'").fetchone()[0]
+        failed = total - passed
+        return {
+            "reports": reports,
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "success_rate_percent": round((passed / total) * 100, 1) if total else None,
+            "returned": len(reports),
+        }
+
+
+@app.get("/api/reports/drills.csv")
+def export_recovery_drills_csv():
+    """Export all persisted drill reports and their step summaries as CSV."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM recovery_drills ORDER BY started_at DESC"
+        ).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["drill_id", "service_id", "result", "started_at", "duration_seconds", "backup_id", "steps"])
+    for row in rows:
+        try:
+            steps = json.loads(row["report_json"])
+            steps_text = " | ".join(
+                f"{step.get('name', 'Step')}: {step.get('status', 'UNKNOWN')} — {step.get('detail', '')}"
+                for step in steps
+            )
+        except (TypeError, json.JSONDecodeError):
+            steps_text = ""
+        writer.writerow([row["id"], row["service_id"], row["result"], row["started_at"], row["duration_seconds"], row["backup_id"] or "", steps_text])
+    output.seek(0)
+    filename = f"cloudrecover-drill-reports-{current_time().date().isoformat()}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/aws/status")
+def aws_integration_status():
+    """Report optional AWS SDK/credential availability without exposing secrets."""
+    if importlib.util.find_spec("boto3") is None:
+        return {"available": False, "sdk_installed": False, "credentials_detected": False,
+                "message": "AWS SDK is not installed. Install requirements-aws.txt to enable read-only inventory."}
+    try:
+        import boto3
+        credentials_detected = boto3.Session().get_credentials() is not None
+        return {"available": credentials_detected, "sdk_installed": True,
+                "credentials_detected": credentials_detected,
+                "message": "AWS SDK ready; credentials detected." if credentials_detected else
+                           "AWS SDK installed, but no credentials were found in the standard AWS credential chain."}
+    except Exception as exc:
+        return {"available": False, "sdk_installed": True, "credentials_detected": False,
+                "message": f"Could not inspect AWS credential configuration: {str(exc)[:240]}"}
+
+
+@app.get("/api/aws/s3/buckets")
+def aws_s3_buckets():
+    """Read-only S3 bucket inventory. Uses the standard AWS credential chain."""
+    if importlib.util.find_spec("boto3") is None:
+        raise HTTPException(503, "AWS SDK missing. Install with: pip install -r requirements-aws.txt")
+    try:
+        import boto3
+        client = boto3.client("s3")
+        response = client.list_buckets()
+        buckets = [{"name": item["Name"], "created_at": item.get("CreationDate").isoformat() if item.get("CreationDate") else None}
+                   for item in response.get("Buckets", [])]
+        with get_db() as db:
+            log_event(db, "AWS_S3_BUCKET_INVENTORY", f"Read-only inventory requested; {len(buckets)} bucket(s) returned")
+        return {"buckets": buckets, "count": len(buckets), "read_only": True}
+    except Exception as exc:
+        # Do not return SDK internals, request headers, or credentials to the browser.
+        raise HTTPException(502, f"Could not list S3 buckets. Check AWS credentials and s3:ListAllMyBuckets permission. Details: {str(exc)[:240]}")
+
+
+@app.get("/api/aws/s3/objects")
+def aws_s3_objects(bucket: str = Query(min_length=3, max_length=255), prefix: str = Query(default="", max_length=1024)):
+    """Read-only listing of up to 1000 S3 object metadata rows for a chosen bucket."""
+    if importlib.util.find_spec("boto3") is None:
+        raise HTTPException(503, "AWS SDK missing. Install with: pip install -r requirements-aws.txt")
+    try:
+        import boto3
+        client = boto3.client("s3")
+        response = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
+        objects = [{"key": item["Key"], "size_bytes": item.get("Size", 0),
+                    "last_modified": item.get("LastModified").isoformat() if item.get("LastModified") else None,
+                    "etag": str(item.get("ETag", "")).strip('"')}
+                   for item in response.get("Contents", [])]
+        with get_db() as db:
+            log_event(db, "AWS_S3_OBJECT_INVENTORY", f"Read-only inventory requested for bucket {bucket}, prefix {prefix!r}; {len(objects)} object(s) returned")
+        return {"bucket": bucket, "prefix": prefix, "objects": objects,
+                "count": len(objects), "truncated": bool(response.get("IsTruncated")), "read_only": True}
+    except Exception as exc:
+        raise HTTPException(502, f"Could not list S3 objects. Check bucket access and s3:ListBucket permission. Details: {str(exc)[:240]}")

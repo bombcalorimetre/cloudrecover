@@ -18,7 +18,13 @@ import {
   ScrollText,
   Server,
   ShieldAlert,
+  ClipboardCheck,
+  ListChecks,
   Zap,
+  Download,
+  FileText,
+  CloudCog,
+  Search,
 } from "lucide-react";
 import "./App.css";
 
@@ -32,7 +38,7 @@ function formatDate(value) {
 
 function statusClass(value = "") {
   const status = String(value).toLowerCase();
-  if (["healthy", "succeeded", "success", "ready", "completed"].includes(status)) return "healthy";
+  if (["healthy", "succeeded", "success", "ready", "completed", "passed", "pass"].includes(status)) return "healthy";
   if (["failed", "corrupted", "blocked"].includes(status)) return "failed";
   if (["pending", "running", "recovering"].includes(status)) return "pending";
   return "neutral";
@@ -46,12 +52,25 @@ function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [backupService, setBackupService] = useState("payments-api");
   const [recoveryPoint, setRecoveryPoint] = useState("");
+  const [drillService, setDrillService] = useState("payments-api");
+  const [reportData, setReportData] = useState(null);
+  const [awsStatus, setAwsStatus] = useState(null);
+  const [awsBuckets, setAwsBuckets] = useState([]);
+  const [awsBucket, setAwsBucket] = useState("");
+  const [awsPrefix, setAwsPrefix] = useState("");
+  const [awsObjects, setAwsObjects] = useState([]);
+  const [awsLoading, setAwsLoading] = useState(false);
+  const [awsMessage, setAwsMessage] = useState("");
 
   const loadDashboard = useCallback(async () => {
     try {
       const response = await fetch(`${API}/api/dashboard`);
       if (!response.ok) throw new Error("Could not load dashboard");
       setData(await response.json());
+      try {
+        const reportResponse = await fetch(`${API}/api/reports/drills?limit=1000`);
+        if (reportResponse.ok) setReportData(await reportResponse.json());
+      } catch { /* Dashboard remains usable if report history is temporarily unavailable. */ }
       setLastUpdated(new Date());
       setMessage("");
     } catch {
@@ -117,6 +136,25 @@ function App() {
   }
 
   const summary = data?.summary;
+  const analyticsServices = data?.services ?? [];
+  const analyticsIncidents = data?.incidents ?? [];
+  const terminalIncidents = analyticsIncidents.filter((incident) =>
+    ["SUCCEEDED", "FAILED"].includes(String(incident.recovery_status ?? "").toUpperCase())
+  );
+  const successfulIncidents = terminalIncidents.filter((incident) =>
+    String(incident.recovery_status ?? "").toUpperCase() === "SUCCEEDED"
+  );
+  const timedRecoveries = successfulIncidents.filter((incident) =>
+    Number.isFinite(Number(incident.recovery_duration)) && incident.recovery_duration != null
+  );
+  const rtoMetRecoveries = timedRecoveries.filter((incident) => {
+    const target = analyticsServices.find((service) => service.id === incident.service_id)?.rto_target_seconds;
+    return target != null && Number(incident.recovery_duration) <= Number(target);
+  });
+  const rpoMetServices = analyticsServices.filter((service) => service.rpo_met === true).length;
+  const latestRecoveryByService = (serviceId) => successfulIncidents.find((incident) => incident.service_id === serviceId && incident.recovery_duration != null);
+  const pct = (value, total) => total ? Math.round((value / total) * 100) : null;
+  const durationLabel = (value) => value == null ? "No recorded recovery" : `${Number(value).toFixed(1)} s`;
 
   return (
     <main className="app">
@@ -128,6 +166,10 @@ function App() {
         <nav className="nav-links" aria-label="Main navigation">
           <a className="active" href="#overview">Overview</a>
           <a href="#services">Services</a>
+          <a href="#analytics">Analytics</a>
+          <a href="#drills">Drills</a>
+          <a href="#reports">Reports</a>
+          <a href="#aws">AWS</a>
           <a href="#backups">Backups</a>
           <a href="#incidents">Incidents</a>
           <a href="#audit">Audit reports</a>
@@ -272,9 +314,17 @@ function App() {
                           </div>
                         </td>
                         <td className="action-column">
-                          <button className="button-action" disabled={busy || service.status === "FAILED"} onClick={() => simulateFailure(service.id)}>
-                            <Play size={12} /> Simulate
-                          </button>
+                          {service.status === "FAILED" ? (
+                            <button className="button-primary" disabled={busy} onClick={() => {
+                              if (window.confirm(`Attempt to recover ${service.name} using its latest valid backup?`)) post(`/api/services/${service.id}/recover`);
+                            }}>
+                              <RotateCcw size={12} /> Recover
+                            </button>
+                          ) : (
+                            <button className="button-action" disabled={busy} onClick={() => simulateFailure(service.id)}>
+                              <Play size={12} /> Simulate
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -286,10 +336,163 @@ function App() {
             </div>
           </section>
 
+          <section className="section-block" id="analytics">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">03 / RECOVERY ANALYTICS</p>
+                <h2>Recovery objectives &amp; outcomes</h2>
+                <p className="section-description">Calculated from current backup records and the latest incident history returned by the API. Durations are simulated, not real AWS measurements.</p>
+              </div>
+              <span className="outline-tag"><Activity size={13} /> DATA-DRIVEN</span>
+            </div>
+            <div className="stats analytics-stats">
+              <article className="metric-card">
+                <div className="metric-top"><span>Services meeting RPO</span><Clock3 size={16} /></div>
+                <div className="metric-value">{rpoMetServices}<span className="metric-unit"> / {analyticsServices.length}</span></div>
+                <div className="metric-progress"><span style={{ width: `${pct(rpoMetServices, analyticsServices.length) ?? 0}%` }} /></div>
+                <div className="metric-foot">{pct(rpoMetServices, analyticsServices.length) == null ? "No service data" : `${pct(rpoMetServices, analyticsServices.length)}% currently compliant`}</div>
+              </article>
+              <article className="metric-card">
+                <div className="metric-top"><span>Recorded recoveries meeting RTO</span><Zap size={16} /></div>
+                <div className="metric-value">{rtoMetRecoveries.length}<span className="metric-unit"> / {timedRecoveries.length}</span></div>
+                <div className="metric-progress"><span style={{ width: `${pct(rtoMetRecoveries.length, timedRecoveries.length) ?? 0}%` }} /></div>
+                <div className="metric-foot">{pct(rtoMetRecoveries.length, timedRecoveries.length) == null ? "No timed successful recoveries yet" : `${pct(rtoMetRecoveries.length, timedRecoveries.length)}% of timed successful recoveries`}</div>
+              </article>
+              <article className="metric-card">
+                <div className="metric-top"><span>Recovery success rate</span><ShieldCheck size={16} /></div>
+                <div className="metric-value">{pct(successfulIncidents.length, terminalIncidents.length) == null ? "—" : pct(successfulIncidents.length, terminalIncidents.length)}<span className="metric-unit">{terminalIncidents.length ? "%" : ""}</span></div>
+                <div className="metric-progress"><span style={{ width: `${pct(successfulIncidents.length, terminalIncidents.length) ?? 0}%` }} /></div>
+                <div className="metric-foot">{terminalIncidents.length} completed or failed incidents in the returned history</div>
+              </article>
+            </div>
+
+            <div className="table-panel analytics-panel">
+              <div className="table-toolbar">
+                <div className="toolbar-title"><Activity size={15} /><span>Service objective detail</span><span className="count-tag">{analyticsServices.length} services</span></div>
+                <span className="table-caption">RPO uses newest backup integrity + age · RTO uses recorded recovery duration</span>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Service</th>
+                      <th>Latest backup age</th>
+                      <th>RPO target</th>
+                      <th>RPO compliance</th>
+                      <th>RTO target</th>
+                      <th>Latest recorded recovery</th>
+                      <th>RTO result</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {analyticsServices.map((service) => {
+                      const recovery = latestRecoveryByService(service.id);
+                      const rtoMet = recovery && recovery.recovery_duration != null
+                        ? Number(recovery.recovery_duration) <= Number(service.rto_target_seconds)
+                        : null;
+                      return (
+                        <tr key={service.id}>
+                          <td><div className="service-cell"><span className="service-icon"><Database size={15} /></span><span><strong>{service.name}</strong><small>{service.id}</small></span></div></td>
+                          <td>{service.backup_age_hours == null ? "No backup" : `${Number(service.backup_age_hours).toFixed(2)} h`}</td>
+                          <td>{service.rpo_target_hours ?? "—"} h</td>
+                          <td><span className={`status-pill ${service.rpo_met ? "healthy" : "failed"}`}><span />{service.rpo_met ? "MET" : "MISSED"}</span><small className="analytics-reason">{service.readiness_reason}</small></td>
+                          <td>{service.rto_target_seconds ?? "—"} s</td>
+                          <td>{durationLabel(recovery?.recovery_duration)}</td>
+                          <td>{rtoMet == null ? <span className="muted-inline">Not measured</span> : <span className={`status-pill ${rtoMet ? "healthy" : "failed"}`}><span />{rtoMet ? "MET" : "MISSED"}</span>}</td>
+                        </tr>
+                      );
+                    })}
+                    {analyticsServices.length === 0 && <tr><td colSpan="7" className="empty-state">No service analytics available.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              <div className="table-footer"><span><span className="footer-led" /> Derived from stored simulation data</span><span>RTO is only evaluated for successful incidents with a recorded duration.</span></div>
+            </div>
+          </section>
+
+          <section className="section-block" id="drills">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">04 / RECOVERY SCENARIO ORCHESTRATION</p>
+                <h2>Recovery drill runner</h2>
+                <p className="section-description">Run a repeatable, non-disruptive drill that checks backup readiness, chooses a recovery point, and evaluates simulated recovery time. It does not change live service state or restore real data.</p>
+              </div>
+              <span className="outline-tag"><ClipboardCheck size={13} /> SIMULATED DRILL</span>
+            </div>
+            <div className="table-panel drill-panel">
+              <form className="drill-run-form" onSubmit={async (event) => {
+                event.preventDefault();
+                const result = await post("/api/drills/run", { service_id: drillService });
+                if (result) setMessage(`${result.message} · ${result.drill_id} · ${result.readiness_score}/100 readiness`);
+              }}>
+                <label>Service to test
+                  <select value={drillService} onChange={(event) => setDrillService(event.target.value)} disabled={busy}>
+                    {(data.services ?? []).map((service) => <option key={service.id} value={service.id}>{service.name}</option>)}
+                  </select>
+                </label>
+                <div className="drill-expectation"><ListChecks size={16} /><span><strong>5-step scenario</strong><small>Detect · Validate · Select · Restore · Check RTO</small></span></div>
+                <button className="button-primary" type="submit" disabled={busy || !(data.services ?? []).length}><Play size={13} /> Run recovery drill</button>
+              </form>
+              <div className="drill-history-heading"><strong><ClipboardCheck size={14} /> Recent drill reports</strong><span>{data.drills?.length ?? 0} saved</span></div>
+              {(data.drills ?? []).length === 0 ? (
+                <div className="empty-state"><ClipboardCheck size={20} /><strong>No recovery drills yet</strong><span>Choose a service and run your first scenario.</span></div>
+              ) : (
+                <div className="drill-report-list">
+                  {data.drills.map((drill) => (
+                    <article className="drill-report" key={drill.id}>
+                      <span className={`drill-result-mark ${drill.result === "PASS" ? "healthy" : "failed"}`}>{drill.result === "PASS" ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}</span>
+                      <div className="drill-report-main">
+                        <div className="drill-report-title"><strong>{drill.service_id}</strong><span className={`status-pill ${drill.result === "PASS" ? "healthy" : "failed"}`}><span />{drill.result}</span><small>#{drill.id}</small></div>
+                        <small>{formatDate(drill.started_at)} · {drill.duration_seconds ? `${Number(drill.duration_seconds).toFixed(1)}s simulated` : "Restore skipped"}</small>
+                        <div className="drill-step-list">
+                          {(drill.steps ?? []).map((step, index) => (
+                            <div className="drill-step" key={`${drill.id}-${index}`}><span className={`drill-step-dot ${statusClass(step.status)}`} /> <span className="drill-step-name">{step.name}</span><span className={`drill-step-status ${statusClass(step.status)}`}>{step.status}</span><small>{step.detail}</small></div>
+                          ))}
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div className="table-footer"><span><span className="footer-led" /> Reports persist in local SQLite</span><span>PASS requires a ready backup and meeting the RTO target; FAIL reports a blocked readiness check or missed objective.</span></div>
+            </div>
+          </section>
+
+          <section className="section-block" id="reports">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">05 / RECOVERY HISTORY & REPORTS</p>
+                <h2>Drill history and reporting</h2>
+                <p className="section-description">Review recent outcomes, track pass-rate trends, export all saved drill records, or print a report to PDF. History is persisted in local SQLite.</p>
+              </div>
+              <div className="report-actions">
+                <a className="button-action report-link" href={`${API}/api/reports/drills.csv`}><Download size={13} /> Export CSV</a>
+                <button className="button-action" onClick={() => window.print()}><FileText size={13} /> Print / Save PDF</button>
+              </div>
+            </div>
+            <div className="stats report-stats">
+              <article className="metric-card"><div className="metric-top">Saved drills <ClipboardCheck size={15} /></div><div className="metric-value">{reportData?.total ?? data.drills?.length ?? 0}</div><div className="metric-foot">Persisted drill reports</div></article>
+              <article className="metric-card"><div className="metric-top">Recent passes <CheckCircle2 size={15} /></div><div className="metric-value">{reportData?.passed ?? (data.drills ?? []).filter((drill) => drill.result === "PASS").length}</div><div className="metric-foot">Across saved drill history</div></article>
+              <article className="metric-card"><div className="metric-top">Recent failures <AlertTriangle size={15} /></div><div className="metric-value">{reportData?.failed ?? (data.drills ?? []).filter((drill) => drill.result !== "PASS").length}</div><div className="metric-foot">Includes readiness or RTO failures</div></article>
+              <article className="metric-card"><div className="metric-top">Pass rate <Activity size={15} /></div><div className="metric-value">{reportData?.success_rate_percent ?? ((data.drills ?? []).length ? Math.round(((data.drills ?? []).filter((drill) => drill.result === "PASS").length / data.drills.length) * 100) : "—")}<span className="metric-unit">{(reportData?.total ?? data.drills?.length ?? 0) ? "%" : ""}</span></div><div className="metric-foot">Across all saved drill reports</div></article>
+            </div>
+            <div className="table-panel report-history-panel">
+              <div className="drill-history-heading"><strong><FileText size={14} /> Recovery history</strong><span>Newest first · {reportData?.returned ?? data.drills?.length ?? 0} shown of {reportData?.total ?? data.drills?.length ?? 0}</span></div>
+              {(reportData?.reports ?? data.drills ?? []).length === 0 ? (
+                <div className="empty-state"><FileText size={20} /><strong>No reports available</strong><span>Run a recovery drill to start building a history.</span></div>
+              ) : (
+                <div className="table-wrap"><table className="data-table"><thead><tr><th>Drill</th><th>Service</th><th>Result</th><th>Started</th><th>Duration</th><th>Backup</th></tr></thead><tbody>
+                  {(reportData?.reports ?? data.drills ?? []).map((drill) => <tr key={`report-${drill.id}`}><td><code>{drill.id}</code></td><td>{drill.service_id}</td><td><span className={`status-pill ${drill.result === "PASS" ? "healthy" : "failed"}`}><span />{drill.result}</span></td><td>{formatDate(drill.started_at)}</td><td>{Number(drill.duration_seconds) > 0 ? `${Number(drill.duration_seconds).toFixed(1)} s` : "Restore skipped"}</td><td><code>{drill.backup_id ?? "—"}</code></td></tr>)}
+                </tbody></table></div>
+              )}
+              <div className="table-footer"><span><span className="footer-led" /> CSV export includes all saved drills</span><span>Print / Save PDF uses your browser's print dialog.</span></div>
+            </div>
+          </section>
+
           <section className="section-block" id="backups">
             <div className="section-title-row">
               <div>
-                <p className="eyebrow">03 / BACKUP MANAGEMENT</p>
+                <p className="eyebrow">06 / BACKUP MANAGEMENT</p>
                 <h2>Backup inventory</h2>
                 <p className="section-description">Create and inspect local backup records, or simulate integrity and age problems. These actions do not create real cloud backups.</p>
               </div>
@@ -340,10 +543,63 @@ function App() {
             </div>
           </section>
 
+          <section className="section-block" id="aws">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">07 / OPTIONAL CLOUD CONNECTOR</p>
+                <h2>AWS S3 inventory</h2>
+                <p className="section-description">Connect using the standard AWS credential chain (environment variables, shared profile, or IAM role) to inspect S3 bucket and object metadata. This integration is read-only; it does not create, delete, restore, or modify cloud resources.</p>
+              </div>
+              <span className="outline-tag"><CloudCog size={13} /> READ-ONLY</span>
+            </div>
+            <div className="table-panel aws-panel">
+              <div className="aws-toolbar">
+                <div className="aws-status-copy"><strong>{awsStatus ? (awsStatus.available ? "AWS SDK and credentials detected" : "AWS connection not configured") : "AWS connector not checked"}</strong><small>{awsStatus?.message ?? "Check local SDK and credential configuration; no credentials are displayed or saved by CloudRecover."}</small></div>
+                <button className="button-action" disabled={awsLoading} onClick={async () => {
+                  setAwsLoading(true); setAwsMessage("");
+                  try {
+                    const response = await fetch(`${API}/api/aws/status`); const result = await response.json();
+                    setAwsStatus(result); setAwsMessage(result.message || "AWS status checked.");
+                  } catch { setAwsMessage("Could not reach the backend to check AWS configuration."); }
+                  finally { setAwsLoading(false); }
+                }}><RefreshCw size={13} /> Check setup</button>
+                <button className="button-primary" disabled={awsLoading} onClick={async () => {
+                  setAwsLoading(true); setAwsMessage("");
+                  try {
+                    const response = await fetch(`${API}/api/aws/s3/buckets`); const result = await response.json();
+                    if (!response.ok) throw new Error(result.detail || "Could not list S3 buckets");
+                    setAwsBuckets(result.buckets ?? []); setAwsBucket((current) => current || result.buckets?.[0]?.name || "");
+                    setAwsMessage(`${result.count} S3 bucket(s) listed. Read-only operation.`);
+                  } catch (error) { setAwsMessage(error.message); }
+                  finally { setAwsLoading(false); }
+                }}><Search size={13} /> List S3 buckets</button>
+              </div>
+              {awsMessage && <div className={`aws-message ${awsMessage.toLowerCase().includes("could not") || awsMessage.toLowerCase().includes("missing") || awsMessage.toLowerCase().includes("not found") ? "notice-warning" : ""}`}>{awsMessage}</div>}
+              {awsBuckets.length > 0 && <form className="aws-object-form" onSubmit={async (event) => {
+                event.preventDefault(); if (!awsBucket) return;
+                setAwsLoading(true); setAwsMessage("");
+                try {
+                  const params = new URLSearchParams({ bucket: awsBucket, prefix: awsPrefix });
+                  const response = await fetch(`${API}/api/aws/s3/objects?${params.toString()}`); const result = await response.json();
+                  if (!response.ok) throw new Error(result.detail || "Could not list objects");
+                  setAwsObjects(result.objects ?? []); setAwsMessage(`${result.count} object metadata row(s) loaded${result.truncated ? " (results capped at 1,000)" : ""}.`);
+                } catch (error) { setAwsMessage(error.message); }
+                finally { setAwsLoading(false); }
+              }}>
+                <label>Bucket<select value={awsBucket} onChange={(event) => setAwsBucket(event.target.value)}>{awsBuckets.map((bucket) => <option key={bucket.name} value={bucket.name}>{bucket.name}</option>)}</select></label>
+                <label>Prefix filter <input value={awsPrefix} onChange={(event) => setAwsPrefix(event.target.value)} placeholder="optional/path/" maxLength={1024} /></label>
+                <button className="button-primary" disabled={awsLoading}><Search size={13} /> Inspect objects</button>
+              </form>}
+              {awsBuckets.length > 0 && <div className="aws-bucket-list"><strong>Accessible buckets</strong>{awsBuckets.map((bucket) => <button key={bucket.name} className={`button-action ${awsBucket === bucket.name ? "aws-selected" : ""}`} onClick={() => { setAwsBucket(bucket.name); setAwsObjects([]); }}><Database size={12} /> {bucket.name}<small>{bucket.created_at ? formatDate(bucket.created_at) : "Creation date unavailable"}</small></button>)}</div>}
+              {awsObjects.length > 0 && <div className="table-wrap"><table className="data-table"><thead><tr><th>Object key</th><th>Size</th><th>Last modified</th><th>ETag</th></tr></thead><tbody>{awsObjects.map((object) => <tr key={`${object.key}-${object.etag}`}><td><code>{object.key}</code></td><td>{Number(object.size_bytes).toLocaleString()} B</td><td>{formatDate(object.last_modified)}</td><td><code>{object.etag}</code></td></tr>)}</tbody></table></div>}
+              <div className="table-footer"><span><span className="footer-led" /> AWS actions are read-only</span><span>Requires boto3 and IAM permissions for listing buckets/objects; no AWS credentials are stored in SQLite.</span></div>
+            </div>
+          </section>
+
           <div className="lower-grid">
             <section className="section-block lower-section" id="incidents">
               <div className="section-title-row">
-                <div><p className="eyebrow">04 / EVENT HISTORY</p><h2>Recovery incidents</h2></div>
+                <div><p className="eyebrow">07 / EVENT HISTORY</p><h2>Recovery incidents</h2></div>
                 <span className="small-count">{data.incidents?.length ?? 0} records</span>
               </div>
               <div className="activity-panel">
@@ -371,7 +627,7 @@ function App() {
 
             <section className="section-block lower-section" id="audit">
               <div className="section-title-row">
-                <div><p className="eyebrow">05 / AUDIT TRAIL</p><h2>System activity</h2></div>
+                <div><p className="eyebrow">08 / AUDIT TRAIL</p><h2>System activity</h2></div>
                 <span className="small-count">{data.audit?.length ?? 0} events</span>
               </div>
               <div className="activity-panel audit-panel">
