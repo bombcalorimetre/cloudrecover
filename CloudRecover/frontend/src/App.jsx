@@ -1,19 +1,37 @@
-
 import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  CheckCircle2,
+  Clock3,
+  Cloud,
   Database,
+  FileClock,
+  Play,
   RefreshCw,
   ShieldCheck,
-  Play,
-  Cloud,
-  Clock,
   ScrollText,
+  Server,
+  ShieldAlert,
+  Zap,
 } from "lucide-react";
 import "./App.css";
 
 const API = "http://127.0.0.1:8000";
+
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}
+
+function statusClass(value = "") {
+  const status = String(value).toLowerCase();
+  if (["healthy", "succeeded", "success", "ready", "completed"].includes(status)) return "healthy";
+  if (["failed", "corrupted", "blocked"].includes(status)) return "failed";
+  if (["pending", "running", "recovering"].includes(status)) return "pending";
+  return "neutral";
+}
 
 function App() {
   const [data, setData] = useState(null);
@@ -41,26 +59,19 @@ function App() {
   async function post(path, body = {}) {
     setBusy(true);
     setMessage("");
-
     try {
       const response = await fetch(`${API}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-
       const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.detail || "Request failed");
-      }
-
+      if (!response.ok) throw new Error(result.detail || "Request failed");
       if (result.status === "FAILED") {
         setMessage(`Recovery blocked: ${result.reason}`);
       } else {
         setMessage(result.message || `Recovery status: ${result.status}`);
       }
-
       await loadDashboard();
       return result;
     } catch (error) {
@@ -72,31 +83,24 @@ function App() {
   }
 
   async function simulateFailure(serviceId) {
-    const confirmed = window.confirm(
-      `Simulate a failure for ${serviceId}?`
-    );
-
-    if (!confirmed) return;
-
-    const incident = await post("/api/failures", {
-      service_id: serviceId,
-    });
-
+    if (!window.confirm(`Simulate a failure for ${serviceId}?`)) return;
+    const incident = await post("/api/failures", { service_id: serviceId });
     if (incident?.incident_id) {
-      const runRecovery = window.confirm(
-        "Failure detected. Run the recovery simulation now?"
-      );
-
-      if (runRecovery) {
-        await post(
-          `/api/recoveries/${incident.incident_id}/execute`
-        );
+      if (window.confirm("Failure detected. Run the recovery simulation now?")) {
+        await post(`/api/recoveries/${incident.incident_id}/execute`);
       }
     }
   }
 
   if (loading && !data) {
-    return <main className="app"><h1>CloudRecover</h1><p>Loading dashboard...</p></main>;
+    return (
+      <main className="app loading-screen">
+        <div className="brand-mark"><Cloud size={20} /></div>
+        <p className="eyebrow">LOCAL DISASTER RECOVERY SIMULATOR</p>
+        <h1>CloudRecover</h1>
+        <p className="muted">Loading recovery environment…</p>
+      </main>
+    );
   }
 
   const summary = data?.summary;
@@ -104,156 +108,218 @@ function App() {
   return (
     <main className="app">
       <header className="topbar">
-        <div className="brand">
-          <div className="brand-icon"><Cloud size={27} /></div>
-          <div>
-            <p className="eyebrow">CLOUD RESILIENCE PLATFORM</p>
-            <h1>CloudRecover</h1>
-            <p className="muted">Disaster recovery and backup readiness</p>
-          </div>
+        <a className="brand" href="#overview" aria-label="CloudRecover overview">
+          <span className="brand-mark"><Cloud size={19} /></span>
+          <span className="brand-name">CloudRecover<span className="brand-period">.</span></span>
+        </a>
+        <nav className="nav-links" aria-label="Main navigation">
+          <a className="active" href="#overview">Overview</a>
+          <a href="#services">Services</a>
+          <a href="#incidents">Incidents</a>
+          <a href="#audit">Audit reports</a>
+        </nav>
+        <div className="topbar-actions">
+          <span className="local-indicator"><span /> Local simulation</span>
+          <button className="button-primary" onClick={loadDashboard} disabled={busy}>
+            <RefreshCw size={14} className={busy ? "spin" : ""} /> Refresh data
+          </button>
         </div>
-        <button className="secondary-button" onClick={loadDashboard} disabled={busy}>
-          <RefreshCw size={16} /> Refresh
-        </button>
       </header>
 
-      {message && <div className="notice">{message}</div>}
+      <section className="hero" id="overview">
+        <div className="hero-copy">
+          <p className="eyebrow"><span className="eyebrow-line" /> RESILIENCE CONTROL CENTER</p>
+          <h1>Disaster recovery <span>readiness report</span></h1>
+          <p className="hero-description">
+            Monitor backup integrity, service readiness, and recovery activity across your local simulation environment.
+          </p>
+        </div>
+        <div className="report-meta">
+          <div className="meta-icon"><ShieldCheck size={19} /></div>
+          <div>
+            <span className="meta-label">ENVIRONMENT STATUS</span>
+            <strong><span className="status-dot" /> Local-only mode</strong>
+            <small>No live cloud resources are provisioned</small>
+          </div>
+        </div>
+      </section>
 
-      {data && (
+      {message && (
+        <div className={`notice ${message.toLowerCase().includes("blocked") || message.toLowerCase().includes("cannot") ? "notice-warning" : ""}`} role="status">
+          <AlertTriangle size={16} />
+          <span>{message}</span>
+          <button className="notice-dismiss" onClick={() => setMessage("")} aria-label="Dismiss message">×</button>
+        </div>
+      )}
+
+      {data && summary && (
         <>
-          <section className="stats">
-            {[
-              { label: "Monitored services", value: summary.total_services, icon: Activity },
-              { label: "Healthy services", value: summary.healthy_services, icon: ShieldCheck },
-              { label: "Open incidents", value: summary.open_incidents, icon: AlertTriangle },
-              { label: "Average readiness", value: `${summary.average_readiness}%`, icon: Database },
-            ].map(({ label, value, icon: Icon }) => (
-              <article className="panel stat" key={label}>
-                <div className="stat-icon"><Icon size={20} /></div>
-                <p>{label}</p>
-                <h2>{value}</h2>
+          <section className="section-block" aria-label="Executive summary">
+            <div className="section-title-row">
+              <div>
+                <p className="eyebrow">01 / EXECUTIVE SUMMARY</p>
+                <h2>Recovery posture</h2>
+              </div>
+              <span className="section-note"><Activity size={13} /> Live from local API</span>
+            </div>
+            <div className="stats">
+              <article className="metric-card">
+                <div className="metric-top"><span>Monitored services</span><Server size={16} /></div>
+                <div className="metric-value">{summary.total_services ?? 0}</div>
+                <div className="metric-foot"><span className="metric-mark"><Activity size={12} /></span> Services tracked</div>
               </article>
-            ))}
+              <article className="metric-card">
+                <div className="metric-top"><span>Healthy services</span><CheckCircle2 size={16} /></div>
+                <div className="metric-value">{summary.healthy_services ?? 0}<span className="metric-unit"> / {summary.total_services ?? 0}</span></div>
+                <div className="metric-foot"><span className="green-text">●</span> Currently healthy</div>
+              </article>
+              <article className="metric-card">
+                <div className="metric-top"><span>Open incidents</span><ShieldAlert size={16} /></div>
+                <div className="metric-value">{summary.open_incidents ?? 0}</div>
+                <div className="metric-foot"><span className="metric-mark amber"><AlertTriangle size={12} /></span> Requiring attention</div>
+              </article>
+              <article className="metric-card featured-metric">
+                <div className="metric-top"><span>Average readiness</span><Database size={16} /></div>
+                <div className="metric-value">{summary.average_readiness ?? 0}<span className="metric-unit">%</span></div>
+                <div className="metric-progress"><span style={{ width: `${Math.max(0, Math.min(100, Number(summary.average_readiness) || 0))}%` }} /></div>
+                <div className="metric-foot">Across monitored services</div>
+              </article>
+            </div>
           </section>
 
-          <section className="panel">
-            <div className="section-heading">
+          <section className="section-block" id="services">
+            <div className="section-title-row">
               <div>
-                <h2>Service health</h2>
-                <p className="muted">Simulate an outage to test recovery readiness.</p>
+                <p className="eyebrow">02 / SERVICE INVENTORY</p>
+                <h2>Service readiness</h2>
+                <p className="section-description">Inspect backup status and simulate a service outage to test recovery readiness.</p>
               </div>
-              <span className="demo-label">LOCAL SIMULATION</span>
+              <span className="outline-tag"><span className="status-dot" /> SIMULATION CONTROLS</span>
             </div>
-
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Service</th>
-                    <th>Health</th>
-                    <th>Readiness</th>
-                    <th>Latest backup</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.services.map((service) => (
-                    <tr key={service.id}>
-                      <td>
-                        <strong>{service.name}</strong>
-                        <small>{service.id}</small>
-                      </td>
-                      <td>
-                        <span className={`pill ${service.status.toLowerCase()}`}>
-                          {service.status}
-                        </span>
-                      </td>
-                      <td>
-                        <div className="score">
-                          <div className="track">
-                            <div className="fill" style={{ width: `${service.readiness_score}%` }} />
-                          </div>
-                          <strong>{service.readiness_score}%</strong>
-                        </div>
-                        <small>{service.readiness_reason}</small>
-                      </td>
-                      <td>
-                        {service.latest_backup
-                          ? new Date(service.latest_backup.created_at).toLocaleString()
-                          : "No backup"}
-                      </td>
-                      <td>
-                        <button
-                          disabled={busy || service.status === "FAILED"}
-                          onClick={() => simulateFailure(service.id)}
-                        >
-                          <Play size={14} /> Simulate
-                        </button>
-                      </td>
+            <div className="table-panel">
+              <div className="table-toolbar">
+                <div className="toolbar-title"><Database size={15} /><span>Monitored services</span><span className="count-tag">{data.services?.length ?? 0}</span></div>
+                <span className="table-caption">Read-only inventory · Actions affect local simulation data</span>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Service</th>
+                      <th>Service status</th>
+                      <th>Readiness score</th>
+                      <th>Latest backup</th>
+                      <th>Recovery objectives</th>
+                      <th className="action-column">Action</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {(data.services ?? []).map((service) => (
+                      <tr key={service.id}>
+                        <td>
+                          <div className="service-cell">
+                            <span className="service-icon"><Database size={16} /></span>
+                            <span><strong>{service.name}</strong><small>{service.id}</small></span>
+                          </div>
+                        </td>
+                        <td><span className={`status-pill ${statusClass(service.status)}`}><span />{service.status}</span></td>
+                        <td>
+                          <div className="readiness-cell">
+                            <div className="readiness-number">{service.readiness_score ?? 0}<span>%</span></div>
+                            <div className="readiness-track"><span className={Number(service.readiness_score) < 60 ? "low" : ""} style={{ width: `${Math.max(0, Math.min(100, Number(service.readiness_score) || 0))}%` }} /></div>
+                            <small>{service.readiness_reason}</small>
+                          </div>
+                        </td>
+                        <td>
+                          {service.latest_backup ? (
+                            <div className="backup-cell">
+                              <span className={`backup-icon ${statusClass(service.latest_backup.integrity)}`}><FileClock size={15} /></span>
+                              <span><strong>{service.latest_backup.integrity ?? "Available"}</strong><small>{formatDate(service.latest_backup.created_at)}</small></span>
+                            </div>
+                          ) : <span className="muted-inline">No backup found</span>}
+                        </td>
+                        <td>
+                          <div className="objective-cell">
+                            <span><small>RPO</small><strong>{service.rpo_target_hours ?? "—"}<em>h</em></strong></span>
+                            <span><small>RPO status</small><strong className={service.rpo_met ? "green-text" : "amber-text"}>{service.rpo_met == null ? "—" : service.rpo_met ? "Met" : "Missed"}</strong></span>
+                            <span><small>RTO</small><strong>{service.rto_target_seconds ?? "—"}<em>s</em></strong></span>
+                          </div>
+                        </td>
+                        <td className="action-column">
+                          <button className="button-action" disabled={busy || service.status === "FAILED"} onClick={() => simulateFailure(service.id)}>
+                            <Play size={12} /> Simulate
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {(!data.services || data.services.length === 0) && <tr><td colSpan="6" className="empty-state">No services returned by the API.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              <div className="table-footer"><span><span className="footer-led" /> Connected to FastAPI</span><span>RPO = Recovery Point Objective · RTO = Recovery Time Objective</span></div>
             </div>
           </section>
 
           <div className="lower-grid">
-            <section className="panel">
-              <div className="section-heading">
-                <h2><AlertTriangle size={18} /> Recovery incidents</h2>
+            <section className="section-block lower-section" id="incidents">
+              <div className="section-title-row">
+                <div><p className="eyebrow">03 / EVENT HISTORY</p><h2>Recovery incidents</h2></div>
+                <span className="small-count">{data.incidents?.length ?? 0} records</span>
               </div>
-              {data.incidents.length === 0 ? (
-                <p className="muted empty">No incidents yet. Start a simulation above.</p>
-              ) : (
-                <div className="incident-list">
-                  {data.incidents.map((incident) => (
-                    <article className="incident" key={incident.id}>
-                      <div>
-                        <strong>{incident.service_id}</strong>
-                        <small>Incident {incident.id}</small>
-                        <small>{new Date(incident.created_at).toLocaleString()}</small>
-                      </div>
-                      <div className="incident-result">
-                        <span className={`pill ${incident.recovery_status.toLowerCase()}`}>
-                          {incident.recovery_status}
-                        </span>
-                        <small>
-                          {incident.recovery_duration == null
-                            ? "Duration —"
-                            : `${incident.recovery_duration}s simulated`}
-                        </small>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )}
+              <div className="activity-panel">
+                {(data.incidents ?? []).length === 0 ? (
+                  <div className="empty-state"><CheckCircle2 size={20} /><strong>No incidents recorded</strong><span>Run a service simulation to create an incident.</span></div>
+                ) : (
+                  <div className="incident-list">
+                    {data.incidents.map((incident) => (
+                      <article className="incident-row" key={incident.id}>
+                        <span className={`event-icon ${statusClass(incident.recovery_status)}`}><Zap size={15} /></span>
+                        <div className="incident-main">
+                          <strong>{incident.service_id}</strong>
+                          <span>Incident #{incident.id} · {formatDate(incident.created_at)}</span>
+                        </div>
+                        <div className="incident-end">
+                          <span className={`status-pill ${statusClass(incident.recovery_status)}`}><span />{incident.recovery_status}</span>
+                          <small>{incident.recovery_duration == null ? "Duration —" : `${incident.recovery_duration}s simulated`}</small>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
             </section>
 
-            <section className="panel">
-              <div className="section-heading">
-                <h2><ScrollText size={18} /> Audit timeline</h2>
+            <section className="section-block lower-section" id="audit">
+              <div className="section-title-row">
+                <div><p className="eyebrow">04 / AUDIT TRAIL</p><h2>System activity</h2></div>
+                <span className="small-count">{data.audit?.length ?? 0} events</span>
               </div>
-              <div className="audit-list">
-                {data.audit.map((event) => (
-                  <article className="audit-event" key={event.id}>
-                    <span className="audit-dot" />
-                    <div>
-                      <strong>{event.event.replaceAll("_", " ")}</strong>
-                      <p>{event.details}</p>
-                      <small>{new Date(event.created_at).toLocaleString()}</small>
-                    </div>
-                  </article>
-                ))}
+              <div className="activity-panel audit-panel">
+                {(data.audit ?? []).length === 0 ? (
+                  <div className="empty-state"><ScrollText size={20} /><strong>No audit events</strong><span>Events will appear here as actions occur.</span></div>
+                ) : (
+                  <div className="audit-list">
+                    {data.audit.map((event) => (
+                      <article className="audit-row" key={event.id}>
+                        <span className="audit-line"><span /></span>
+                        <div className="audit-content">
+                          <div className="audit-event-heading"><strong>{String(event.event ?? "Event").replaceAll("_", " ")}</strong><time>{formatDate(event.created_at)}</time></div>
+                          <p>{event.details}</p>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
               </div>
             </section>
           </div>
-
-          <footer>
-            <span><Clock size={14} /> Recovery durations are simulated</span>
-            <span>CloudRecover · Local development mode · No live AWS resources</span>
-          </footer>
         </>
       )}
+
+      <footer className="app-footer">
+        <div className="footer-brand"><span className="brand-mark small"><Cloud size={13} /></span><strong>CloudRecover</strong><span>Local disaster recovery simulator</span></div>
+        <div className="footer-right"><Clock3 size={13} /> Recovery durations are simulated <span className="footer-separator">/</span> No live AWS resources</div>
+      </footer>
     </main>
   );
 }
