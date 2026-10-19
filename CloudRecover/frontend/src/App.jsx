@@ -38,12 +38,14 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [lastUpdated, setLastUpdated] = useState(null);
 
   const loadDashboard = useCallback(async () => {
     try {
       const response = await fetch(`${API}/api/dashboard`);
       if (!response.ok) throw new Error("Could not load dashboard");
       setData(await response.json());
+      setLastUpdated(new Date());
       setMessage("");
     } catch {
       setMessage("Cannot reach the backend. Check that FastAPI is running.");
@@ -54,6 +56,10 @@ function App() {
 
   useEffect(() => {
     loadDashboard();
+    const refreshTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadDashboard();
+    }, 12000);
+    return () => window.clearInterval(refreshTimer);
   }, [loadDashboard]);
 
   async function post(path, body = {}) {
@@ -160,7 +166,7 @@ function App() {
                 <p className="eyebrow">01 / EXECUTIVE SUMMARY</p>
                 <h2>Recovery posture</h2>
               </div>
-              <span className="section-note"><Activity size={13} /> Live from local API</span>
+              <span className="section-note"><Activity size={13} /> Auto-refresh · 12s{lastUpdated ? ` · Updated ${lastUpdated.toLocaleTimeString()}` : ""}</span>
             </div>
             <div className="stats">
               <article className="metric-card">
